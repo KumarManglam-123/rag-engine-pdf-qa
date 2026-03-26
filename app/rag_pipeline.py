@@ -23,7 +23,7 @@ from langchain.prompts import PromptTemplate
 load_dotenv()
 
 # ✅ CONFIG
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "sentence-transformers/paraphrase-MiniLM-L3-v2"
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 CHUNK_SIZE = 500
