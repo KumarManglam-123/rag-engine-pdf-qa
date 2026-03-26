@@ -3,6 +3,7 @@ RAG Pipeline — Core Logic
 --------------------------
 Flow: PDF → Extract Text → Chunk → Embed → FAISS → Retrieve → LLM (Groq)
 """
+# type: ignore
 
 import os
 from typing import Optional, Generator
@@ -13,6 +14,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain.prompts import PromptTemplate
+from typing import Optional
+
 
 # ── Choose your embedding mode ──────────────────────────────────────────────
 # Option A (recommended): Real semantic embeddings — better retrieval quality
@@ -27,7 +30,7 @@ USE_REAL_EMBEDDINGS = False   # ← flip to True when sentence-transformers is i
 if USE_REAL_EMBEDDINGS:
     from langchain_huggingface import HuggingFaceEmbeddings
 else:
-    from langchain.embeddings import FakeEmbeddings  # fixed import path
+    from langchain_community.embeddings import FakeEmbeddings  # fixed import path
 
 load_dotenv()
 
@@ -108,12 +111,11 @@ class RAGPipeline:
         return {"chunks": self._chunk_count}
 
     # ── QUERY (blocking) ─────────────────────────────────────────────────────
-    def query(self, question: str) -> dict:
-        """Retrieve relevant chunks → ask LLM → return full answer."""
+    def query(self, question: str, top_k: int = 3) -> dict:
         if not self.is_ready():
             raise RuntimeError("No document loaded. Upload a PDF first.")
 
-        docs = self._retrieve(question)
+        docs = self._retrieve(question, k=top_k)  # type: ignore
         context = "\n\n".join(d.page_content[:500] for d in docs)
         sources = list({f"Page {d.metadata.get('page', 0) + 1}" for d in docs})
 
@@ -127,20 +129,20 @@ class RAGPipeline:
         }
 
     # ── QUERY (streaming) ────────────────────────────────────────────────────
-    def stream_query(self, question: str) -> Generator[str, None, None]:
-        """Same as query() but yields tokens as they arrive (for SSE / streaming)."""
+    def stream_query(self, question: str, top_k: int = 3):
         if not self.is_ready():
             raise RuntimeError("No document loaded. Upload a PDF first.")
 
-        docs = self._retrieve(question)
-        context = "\n\n".join(d.page_content for d in docs)
+        docs = self._retrieve(question, k=top_k)  # type: ignore
+        context = "\n\n".join(d.page_content[:500] for d in docs)
+
         prompt = RAG_PROMPT.format(context=context, question=question)
 
         for chunk in self.llm.stream(prompt):
             yield chunk.content
 
     # ── HELPERS ──────────────────────────────────────────────────────────────
-    def _retrieve(self, question: str, k: int = 3):
+    def _retrieve(self, question: str, k: int = 3) -> list:
         return self.vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={"k": k},
