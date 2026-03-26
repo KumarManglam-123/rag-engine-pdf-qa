@@ -1,38 +1,44 @@
 """
 RAG Pipeline — Core Logic
-Flow: PDF → Chunk → Embed → FAISS → Retrieve → LLM (Groq)
+--------------------------
+Flow: PDF → Extract Text → Chunk → Embed → FAISS → Retrieve → LLM (Groq)
 """
 
 import os
-import time
-from typing import Optional
+from typing import Optional, Generator
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-
-# 🔥 NEW (memory)
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-
 from langchain.prompts import PromptTemplate
+
+# ── Choose your embedding mode ──────────────────────────────────────────────
+# Option A (recommended): Real semantic embeddings — better retrieval quality
+#   pip install sentence-transformers langchain-huggingface
+#   then set USE_REAL_EMBEDDINGS = True
+#
+# Option B (lightweight/testing): Fake embeddings — no extra install needed
+#   Results will be random — only use for pipeline testing, NOT production
+# ─────────────────────────────────────────────────────────────────────────────
+USE_REAL_EMBEDDINGS = False   # ← flip to True when sentence-transformers is installed
+
+if USE_REAL_EMBEDDINGS:
+    from langchain_huggingface import HuggingFaceEmbeddings
+else:
+    from langchain.embeddings import FakeEmbeddings  # fixed import path
 
 load_dotenv()
 
-# ✅ CONFIG
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-MiniLM-L3-v2"
-GROQ_MODEL = "llama-3.1-8b-instant"
-
-CHUNK_SIZE = 500
+GROQ_MODEL    = "llama-3.1-8b-instant"
+CHUNK_SIZE    = 500
 CHUNK_OVERLAP = 50
 
 RAG_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template="""You are a helpful assistant. Use ONLY the context below to answer the question.
-If the answer is not in the context, say "I couldn't find that in the document."
+    template="""You are a helpful assistant. Use ONLY the context below to answer.
+If the answer is not found in the context, say "I couldn't find that in the document."
 
 Context:
 {context}
@@ -44,158 +50,108 @@ Answer:"""
 
 
 class RAGPipeline:
+
     def __init__(self):
         self.vectorstore: Optional[FAISS] = None
-        self.qa_chain = None
-        self._chunk_count = 0
+        self._chunk_count: int = 0
 
-        # 🔥 MEMORY
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
+        # ── Embeddings ───────────────────────────────────────────────────────
+        if USE_REAL_EMBEDDINGS:
+            print("Loading HuggingFace embeddings (first run downloads ~90MB)...")
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2",
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True},
+            )
+        else:
+            print("⚠️  Lightweight mode ON — using FakeEmbeddings (for testing only)")
+            self.embeddings = FakeEmbeddings(size=384)
 
-        print("Loading embedding model...")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True}
-        )
-
+        # ── LLM ─────────────────────────────────────────────────────────────
         groq_key = os.getenv("GROQ_API_KEY")
         if not groq_key:
-            raise EnvironmentError("GROQ_API_KEY not set.")
+            raise EnvironmentError(
+                "GROQ_API_KEY not set. Add it to your .env file.\n"
+                "Get a free key at: https://console.groq.com"
+            )
 
-        # ✅ LLM
         self.llm = ChatGroq(
             model=GROQ_MODEL,
             temperature=0.2,
             groq_api_key=groq_key,
-            streaming=True
+            streaming=True,
         )
 
-        # Load existing FAISS index
-        if os.path.exists("faiss_index"):
-            try:
-                self.vectorstore = FAISS.load_local(
-                    "faiss_index",
-                    self.embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                self._build_chain()
-                print("Loaded existing FAISS index.")
-            except Exception:
-                print("Failed to load FAISS index.")
+        print("✅ RAG Pipeline ready.")
 
-        print("RAG Pipeline ready.")
-
-    # ---------------------------------------------------
-    # INGEST
-    # ---------------------------------------------------
+    # ── INGEST ───────────────────────────────────────────────────────────────
     def ingest(self, pdf_path: str) -> dict:
-        try:
-            loader = PyPDFLoader(pdf_path)
-            documents = loader.load()
-        except Exception as e:
-            raise ValueError(f"Error loading PDF: {str(e)}")
+        """Load PDF → split into chunks → embed → store in FAISS."""
 
+        # 1. Load
+        loader = PyPDFLoader(pdf_path)
+        docs = loader.load()
+
+        # 2. Chunk
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ".", " "]
+            separators=["\n\n", "\n", ".", " "],
         )
-
-        chunks = splitter.split_documents(documents)
+        chunks = splitter.split_documents(docs)
         self._chunk_count = len(chunks)
 
-        if self.vectorstore:
-            self.vectorstore.add_documents(chunks)
-        else:
-            self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
+        # 3. Embed + index
+        self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
+        self.vectorstore.save_local("faiss_index")
 
-        try:
-            self.vectorstore.save_local("faiss_index")
-        except Exception:
-            pass
+        return {"chunks": self._chunk_count}
 
-        # 🔥 rebuild chain AFTER ingest
-        self._build_chain()
+    # ── QUERY (blocking) ─────────────────────────────────────────────────────
+    def query(self, question: str) -> dict:
+        """Retrieve relevant chunks → ask LLM → return full answer."""
+        if not self.is_ready():
+            raise RuntimeError("No document loaded. Upload a PDF first.")
 
-        return {
-            "chunks": self._chunk_count,
-            "model": EMBEDDING_MODEL
-        }
+        docs = self._retrieve(question)
+        context = "\n\n".join(d.page_content[:500] for d in docs)
+        sources = list({f"Page {d.metadata.get('page', 0) + 1}" for d in docs})
 
-    # ---------------------------------------------------
-    # 🔥 QUERY WITH MEMORY
-    # ---------------------------------------------------
-    def query(self, question: str, top_k: int = 3) -> dict:
-        if not self.qa_chain:
-            raise ValueError("Pipeline not ready.")
-
-        start_time = time.time()
-
-        result = self.qa_chain.invoke({"question": question})
-
-        end_time = time.time()
-
-        sources = []
-        for doc in result.get("source_documents", []):
-            page = doc.metadata.get("page", "?")
-            sources.append(f"Page {page + 1}")
+        prompt = RAG_PROMPT.format(context=context, question=question)
+        response = self.llm.invoke(prompt)
 
         return {
-            "answer": result["answer"].strip(),
-            "sources": list(set(sources)),
-            "chunks_used": len(result.get("source_documents", [])),
-            "response_time": f"{end_time - start_time:.2f}s"
+            "answer": response.content.strip(),
+            "sources": sources,
+            "chunks_used": len(docs),
         }
 
-    # ---------------------------------------------------
-    # 🔥 STREAMING QUERY (ChatGPT typing)
-    # ---------------------------------------------------
-    def stream_query(self, question: str, top_k: int = 3):
-        if not self.vectorstore:
-            raise ValueError("No document uploaded.")
+    # ── QUERY (streaming) ────────────────────────────────────────────────────
+    def stream_query(self, question: str) -> Generator[str, None, None]:
+        """Same as query() but yields tokens as they arrive (for SSE / streaming)."""
+        if not self.is_ready():
+            raise RuntimeError("No document loaded. Upload a PDF first.")
 
-        retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": top_k}
-        )
-
-        docs = retriever.invoke(question)
-
-        context = "\n\n".join([d.page_content for d in docs])
-
-        prompt = RAG_PROMPT.format(
-            context=context,
-            question=question
-        )
+        docs = self._retrieve(question)
+        context = "\n\n".join(d.page_content for d in docs)
+        prompt = RAG_PROMPT.format(context=context, question=question)
 
         for chunk in self.llm.stream(prompt):
             yield chunk.content
 
-    # ---------------------------------------------------
-    # 🔥 BUILD CHAIN WITH MEMORY
-    # ---------------------------------------------------
-    def _build_chain(self):
-        self.qa_chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
-            retriever=self.vectorstore.as_retriever(search_kwargs={"k": 3}),
-            memory=self.memory,
-            return_source_documents=True
-        )
+    # ── HELPERS ──────────────────────────────────────────────────────────────
+    def _retrieve(self, question: str, k: int = 3):
+        return self.vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={"k": k},
+        ).invoke(question)
 
-    # ---------------------------------------------------
-    # HELPERS
-    # ---------------------------------------------------
     def is_ready(self) -> bool:
         return self.vectorstore is not None
 
     def doc_count(self) -> int:
         return self._chunk_count
 
-    def reset(self):
+    def reset(self) -> None:
         self.vectorstore = None
-        self.qa_chain = None
-        self.memory.clear()   # 🔥 IMPORTANT
         self._chunk_count = 0
