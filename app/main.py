@@ -17,7 +17,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 rag = RAGPipeline()
 
